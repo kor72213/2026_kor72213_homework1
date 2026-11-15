@@ -2,6 +2,7 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../database');
 const authMiddleware = require('../middleware/authMiddleware');
+const ecpay = require('../services/ecpay');
 
 const router = express.Router();
 
@@ -413,6 +414,101 @@ router.patch('/:id/pay', (req, res) => {
     error: null,
     message: action === 'success' ? '付款成功' : '付款失敗'
   });
+});
+
+/**
+ * @openapi
+ * /api/orders/{id}/ecpay/checkout:
+ *   post:
+ *     summary: 取得綠界 AIO 付款表單參數（信用卡）
+ *     tags: [Orders]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: 回傳 action 與表單 fields，前端以 POST form 送往綠界
+ *       400:
+ *         description: 訂單狀態不是 pending
+ *       404:
+ *         description: 訂單不存在
+ */
+router.post('/:id/ecpay/checkout', (req, res) => {
+  const order = db.prepare('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(req.params.id, req.user.userId);
+  if (!order) {
+    return res.status(404).json({ data: null, error: 'NOT_FOUND', message: '訂單不存在' });
+  }
+  if (order.status !== 'pending') {
+    return res.status(400).json({
+      data: null,
+      error: 'INVALID_STATUS',
+      message: '訂單狀態不是 pending，無法付款'
+    });
+  }
+  const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id);
+  const merchantTradeNo = ecpay.generateMerchantTradeNo();
+  db.prepare('UPDATE orders SET merchant_trade_no = ? WHERE id = ?').run(merchantTradeNo, order.id);
+
+  res.json({
+    data: ecpay.buildCheckoutParams(order, items, merchantTradeNo),
+    error: null,
+    message: '請前往綠界付款'
+  });
+});
+
+/**
+ * @openapi
+ * /api/orders/{id}/ecpay/query:
+ *   post:
+ *     summary: 主動向綠界查詢付款結果並同步訂單狀態
+ *     tags: [Orders]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: 回傳最新訂單；尚未取得結果時狀態仍為 pending
+ *       400:
+ *         description: 尚未發起綠界付款
+ *       404:
+ *         description: 訂單不存在
+ *       502:
+ *         description: 查詢綠界失敗
+ */
+router.post('/:id/ecpay/query', async (req, res, next) => {
+  try {
+    const order = db.prepare('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(req.params.id, req.user.userId);
+    if (!order) {
+      return res.status(404).json({ data: null, error: 'NOT_FOUND', message: '訂單不存在' });
+    }
+    if (!order.merchant_trade_no) {
+      return res.status(400).json({
+        data: null,
+        error: 'VALIDATION_ERROR',
+        message: '此訂單尚未發起綠界付款'
+      });
+    }
+    const { order: updated, outcome } = await ecpay.syncOrderPayment(order);
+    const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id);
+    const messages = {
+      paid: '付款成功',
+      failed: '付款未成立',
+      pending: '尚未取得付款結果，請稍後再查'
+    };
+    res.json({ data: { ...updated, items }, error: null, message: messages[outcome] });
+  } catch (err) {
+    next(err);
+  }
 });
 
 module.exports = router;

@@ -68,6 +68,17 @@ function initializeDatabase() {
     );
   `);
 
+  // 綠界付款欄位（無 migration 工具：先檢查再 ALTER）
+  const orderCols = db.prepare('PRAGMA table_info(orders)').all().map((c) => c.name);
+  [
+    ['merchant_trade_no', 'TEXT'],
+    ['ecpay_trade_no', 'TEXT'],
+    ['payment_type', 'TEXT'],
+    ['paid_at', 'TEXT'],
+  ].forEach(([name, type]) => {
+    if (!orderCols.includes(name)) db.exec(`ALTER TABLE orders ADD COLUMN ${name} ${type}`);
+  });
+
   // Seed data
   seedAdminUser();
   seedProducts();
